@@ -10,21 +10,26 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 import time
 from dotenv import load_dotenv, find_dotenv
 import torch
-from langchain import HuggingFacePipeline
-from langchain.vectorstores import Chroma
-from langchain.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+from langchain_community.llms import HuggingFacePipeline
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+#from langchain_community.chat_models import ChatOpenAI
+
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, TextStreamer, GPTQConfig
 from kg_rag.config_loader import *
 import ast
 import requests
+
+load_dotenv()
 
 memory = Memory("cachegpt", verbose=0)
 
 # Config openai library
 config_file = config_data['GPT_CONFIG_FILE']
 load_dotenv(config_file)
-api_key = os.environ.get('API_KEY')
+api_key = os.environ.get('OPENAI_API_KEY')
 api_version = os.environ.get('API_VERSION')
 resource_endpoint = os.environ.get('RESOURCE_ENDPOINT')
 openai.api_type = config_data['GPT_API_TYPE']
@@ -50,9 +55,17 @@ def get_spoke_api_resp(base_uri, end_point, params=None):
 def get_context_using_spoke_api(node_value):
     type_end_point = "/api/v1/types"
     result = get_spoke_api_resp(config_data['BASE_URI'], type_end_point)
+
+    result.raise_for_status()
     data_spoke_types = result.json()
+
+    if not isinstance(data_spoke_types, dict) or "nodes" not in data_spoke_types:
+        print(f"Warning: SPOKE API response does not contain 'nodes'. Response: {data_spoke_types}")
+        return "", pd.DataFrame(columns=["source", "edge_type", "target", "provenance", "evidence", "predicate", "context"])
+
     node_types = list(data_spoke_types["nodes"].keys())
     edge_types = list(data_spoke_types["edges"].keys())
+
     node_types_to_remove = ["DatabaseTimestamp", "Version"]
     filtered_node_types = [node_type for node_type in node_types if node_type not in node_types_to_remove]
     api_params = {
