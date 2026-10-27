@@ -1,37 +1,22 @@
-import ast
 import json
 import os
 import pandas as pd
 from datetime import datetime
 from tqdm import tqdm
 from kg_rag.utility import *
+from kg_rag.evaluation import parse_to_list, score_item
 
 CHAT_MODEL_ID_DEFAULT = 'gpt-5.4-mini'
 SYSTEM_PROMPT = system_prompts["PROMPT_BASED_TEXT_GENERATION"]
 TEMPERATURE = config_data["LLM_TEMPERATURE"]
-
-def parse_to_list(val):
-    """String to Python list"""
-    if isinstance(val, list):
-        return val
-    if not val:
-        return []
-    val_str = str(val).strip()
-    if val_str.startswith('[') and val_str.endswith(']'):
-        try:
-            parsed = ast.literal_eval(val_str)
-            if isinstance(parsed, list):
-                return [str(x).strip() for x in parsed]
-        except Exception:
-            pass
-    return [x.strip() for x in val_str.split(',') if x.strip()]
 
 def run_text_generation(
     input_questions_file,
     output_json_file,
     model_id=CHAT_MODEL_ID_DEFAULT,
     api=True,
-    edge_evidence=False
+    edge_evidence=False,
+    reasoning_effort=None
 ):
     print(f"\n--- Benchmark Starting with {model_id}: {input_questions_file} ---")
     
@@ -46,9 +31,9 @@ def run_text_generation(
             data = json.load(f)
 
     embedding_model_name = (
-        config_data.get('SENTENCE_EMBEDDING_MODEL_NAME') or 
-        config_data.get('EMBEDDING_MODEL_NAME') or 
-        "all-MiniLM-L6-v2"
+        config_data.get('VECTOR_DB_SENTENCE_EMBEDDING_MODEL') or
+        config_data.get('SENTENCE_EMBEDDING_MODEL_FOR_NODE_RETRIEVAL') or
+        "sentence-transformers/all-MiniLM-L6-v2"
     )
     embedding_function = load_sentence_transformer(embedding_model_name)
     vectorstore = load_chroma(config_data['VECTOR_DB_PATH'], embedding_model_name)
@@ -59,9 +44,13 @@ def run_text_generation(
     results = []
 
     for row in tqdm(data, desc=f"Processing questions ({model_id})..."):
+        # The answers are full lists, so ask the "Name all ..." variant. The 'prompt'
+        # field asks for a single answer ("Just give me the answer"), which contradicts
+        # the list instruction below and caps recall at 1/len(answers).
         question = (
-            row.get('question') or row.get('prompt') or 
-            row.get('hop2_question') or row.get('hop1_question') or
+            row.get('question') or row.get('hop2_question_multi') or
+            row.get('hop2_question') or row.get('prompt') or
+            row.get('hop1_question_multi') or row.get('hop1_question') or
             row.get('text') or row.get('Question')
         )
 
@@ -77,6 +66,7 @@ def run_text_generation(
         hop1_entity = row.get('hop1', '')
         
         seed_entity = hop2_entity if hop2_entity else hop1_entity
+        seed_type = row.get('hop2_type') if hop2_entity else row.get('hop1_type')
 
         # 1. Context 
         try:
@@ -84,6 +74,7 @@ def run_text_generation(
                 question=question,
                 seed_entity=seed_entity,
                 target_type=target_type,
+                seed_type=seed_type,
                 vectorstore=vectorstore,
                 embedding_function=embedding_function,
                 node_context_df=node_context_df,
@@ -109,16 +100,20 @@ def run_text_generation(
         # 3. LLM Call
         try:
             output, p_tokens, c_tokens, r_tokens, t_tokens = get_GPT_response(
-                full_prompt, SYSTEM_PROMPT, model_id, chat_deployment_id=model_id, temperature=TEMPERATURE, n=1
+                full_prompt, SYSTEM_PROMPT, model_id, chat_deployment_id=model_id, temperature=TEMPERATURE, n=1,
+                reasoning_effort=reasoning_effort
             )
         except Exception as e:
             output, p_tokens, c_tokens, r_tokens, t_tokens = f"Error: {str(e)}", 0, 0, 0, 0
 
-        output_clean = str(output).strip().lower()
-        is_hit = any(ans.lower() in output_clean for ans in correct_answer_list) if correct_answer_list else False
+        is_hit = score_item(output, correct_answer_list)["hit"] if correct_answer_list else False
 
         results.append({
             "question": question,
+            "seed_entity": seed_entity,
+            "seed_type": seed_type,
+            "bridge_entity": hop1_entity if hop2_entity else "",
+            "reasoning_effort": reasoning_effort or "default",
             "options": str(options),
             "correct_answer": correct_answer_list,        
             "retrieved_context": context,
