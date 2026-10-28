@@ -89,10 +89,13 @@ def run_text_generation(
             context = ""
 
         # 2. Instruction
+        # Names may contain commas (e.g. 'pregnancy loss, recurrent, susceptibility to'),
+        # so answers are separated by semicolons
         instruction = (
-            f"\n\nInstruction: Carefully read the retrieved context and answer the question. "
-            f"Extract ONLY the names of the **{target_type}** that correctly answer the question. "
-            f"Output them strictly as a comma-separated list."
+            f"\n\nInstruction: Answer the question using the retrieved context. "
+            f"List the names of ALL {target_type}s that answer the question, copying the names exactly as they appear in the context. "
+            f"If the context is empty or does not contain the answer, answer from your own biomedical knowledge. "
+            f"Output ONLY the names, separated by semicolons (;), with no explanations, no entity-type prefixes and no other text."
         )
 
         full_prompt = f"Context: {context}\n\nQuestion: {question}\nOptions: {options}{instruction}" if options else f"Context: {context}\n\nQuestion: {question}{instruction}"
@@ -117,6 +120,7 @@ def run_text_generation(
             "options": str(options),
             "correct_answer": correct_answer_list,        
             "retrieved_context": context,
+            "context_found": bool(str(context).strip()),
             "model_output": output,
             "is_hit": is_hit,
             "input_tokens": p_tokens,                         
