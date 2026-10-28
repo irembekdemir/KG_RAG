@@ -94,7 +94,6 @@ def run_text_generation(
         instruction = (
             f"\n\nInstruction: Answer the question using the retrieved context. "
             f"List the names of ALL {target_type}s that answer the question, copying the names exactly as they appear in the context. "
-            f"If the context is empty or does not contain the answer, answer from your own biomedical knowledge. "
             f"Output ONLY the names, separated by semicolons (;), with no explanations, no entity-type prefixes and no other text."
         )
 
