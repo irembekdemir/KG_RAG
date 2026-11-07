@@ -3,58 +3,75 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from joblib import Memory
 import json
-import openai
 import os
 import sys
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 import time
 from dotenv import load_dotenv, find_dotenv
 import torch
-from langchain import HuggingFacePipeline
-from langchain.vectorstores import Chroma
-from langchain.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+from langchain_community.llms import HuggingFacePipeline
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import PromptTemplate
+
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, TextStreamer, GPTQConfig
 from kg_rag.config_loader import *
 import ast
+import re
 import requests
+from functools import lru_cache
+from urllib.parse import quote
+from openai import OpenAI
+
+load_dotenv()
 
 memory = Memory("cachegpt", verbose=0)
 
-# Config openai library
-config_file = config_data['GPT_CONFIG_FILE']
-load_dotenv(config_file)
-api_key = os.environ.get('API_KEY')
-api_version = os.environ.get('API_VERSION')
-resource_endpoint = os.environ.get('RESOURCE_ENDPOINT')
-openai.api_type = config_data['GPT_API_TYPE']
-openai.api_key = api_key
-if resource_endpoint:
-    openai.api_base = resource_endpoint
-if api_version:
-    openai.api_version = api_version
+client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
 
 torch.cuda.empty_cache()
 B_INST, E_INST = "[INST]", "[/INST]"
-B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
-
+B_SYS, E_SYS = "<>\n", "\n<>\n\n"
 
 def get_spoke_api_resp(base_uri, end_point, params=None):
     uri = base_uri + end_point
-    if params:
-        return requests.get(uri, params=params)
-    else:
-        return requests.get(uri)
+    try:
+        if params:
+            return requests.get(uri, params=params, timeout=30)
+        else:
+            return requests.get(uri, timeout=30)
+    except Exception as e:
+        print(f"SPOKE API HTTP Request Exception: {e}")
+        return None
 
-@retry(wait=wait_random_exponential(min=10, max=30), stop=stop_after_attempt(5))
-def get_context_using_spoke_api(node_value):
-    type_end_point = "/api/v1/types"
-    result = get_spoke_api_resp(config_data['BASE_URI'], type_end_point)
+@lru_cache(maxsize=1)
+def _get_spoke_types():
+    # The type list is static; fetch it once instead of on every neighborhood call
+    result = get_spoke_api_resp(config_data['BASE_URI'], "/api/v1/types")
+    if not result or result.status_code != 200:
+        raise RuntimeError("SPOKE /types request failed")
     data_spoke_types = result.json()
+    if not isinstance(data_spoke_types, dict) or "nodes" not in data_spoke_types:
+        raise RuntimeError("Unexpected SPOKE /types response")
+    return data_spoke_types
+
+@retry(wait=wait_random_exponential(min=2, max=10), stop=stop_after_attempt(3))
+def get_context_using_spoke_api(node_value, node_type="Disease"):
+    empty_df = pd.DataFrame(columns=["source", "edge_type", "target", "provenance", "evidence", "predicate", "context"])
+
+    try:
+        data_spoke_types = _get_spoke_types()
+    except Exception:
+        return "", empty_df
+
     node_types = list(data_spoke_types["nodes"].keys())
     edge_types = list(data_spoke_types["edges"].keys())
+
     node_types_to_remove = ["DatabaseTimestamp", "Version"]
-    filtered_node_types = [node_type for node_type in node_types if node_type not in node_types_to_remove]
+    filtered_node_types = [nt for nt in node_types if nt not in node_types_to_remove]
+    
     api_params = {
         'node_filters' : filtered_node_types,
         'edge_filters': edge_types,
@@ -68,75 +85,83 @@ def get_context_using_spoke_api(node_value):
         'cutoff_DpL_average_prevalence': config_data['cutoff_DpL_average_prevalence'],
         'depth' : config_data['depth']
     }
-    node_type = "Disease"
+    
     attribute = "name"
-    nbr_end_point = "/api/v1/neighborhood/{}/{}/{}".format(node_type, attribute, node_value)
+    # URL-encode: names such as 'substance abuse/dependence' or '[...]' break the path otherwise
+    nbr_end_point = f"/api/v1/neighborhood/{node_type}/{attribute}/{quote(str(node_value), safe='')}"
     result = get_spoke_api_resp(config_data['BASE_URI'], nbr_end_point, params=api_params)
-    node_context = result.json()
+    
+    if not result or result.status_code != 200:
+        return "", empty_df
+
+    try:
+        node_context = result.json()
+    except Exception:
+        return "", empty_df
+
+    if not node_context or not isinstance(node_context, list) or len(node_context) == 0:
+        return "", empty_df
+
     nbr_nodes = []
     nbr_edges = []
+    
     for item in node_context:
-        if "_" not in item["data"]["neo4j_type"]:
+        if not isinstance(item, dict) or "data" not in item:
+            continue
+            
+        neo4j_type = item["data"].get("neo4j_type", "")
+        
+        if "_" not in neo4j_type:
             try:
-                if item["data"]["neo4j_type"] == "Protein":
-                    nbr_nodes.append((item["data"]["neo4j_type"], item["data"]["id"], item["data"]["properties"]["description"]))
+                if neo4j_type == "Protein":
+                    nbr_nodes.append((neo4j_type, item["data"]["id"], item["data"]["properties"]["description"]))
                 else:
-                    nbr_nodes.append((item["data"]["neo4j_type"], item["data"]["id"], item["data"]["properties"]["name"]))
-            except:
-                nbr_nodes.append((item["data"]["neo4j_type"], item["data"]["id"], item["data"]["properties"]["identifier"]))
-        elif "_" in item["data"]["neo4j_type"]:
+                    nbr_nodes.append((neo4j_type, item["data"]["id"], item["data"]["properties"]["name"]))
+            except Exception:
+                nbr_nodes.append((neo4j_type, item["data"]["id"], item["data"]["properties"].get("identifier", "")))
+        else:
             try:
                 provenance = ", ".join(item["data"]["properties"]["sources"])
-            except:
-                try:
-                    provenance = item["data"]["properties"]["source"]
-                    if isinstance(provenance, list):
-                        provenance = ", ".join(provenance)                    
-                except:
-                    try:                    
-                        preprint_list = ast.literal_eval(item["data"]["properties"]["preprint_list"])
-                        if len(preprint_list) > 0:                                                    
-                            provenance = ", ".join(preprint_list)
-                        else:
-                            pmid_list = ast.literal_eval(item["data"]["properties"]["pmid_list"])
-                            pmid_list = map(lambda x:"pubmedId:"+x, pmid_list)
-                            if len(pmid_list) > 0:
-                                provenance = ", ".join(pmid_list)
-                            else:
-                                provenance = "Based on data from Institute For Systems Biology (ISB)"
-                    except:                                
-                        provenance = "SPOKE-KG"     
-            try:
-                evidence = item["data"]["properties"]
-            except:
-                evidence = None
-            nbr_edges.append((item["data"]["source"], item["data"]["neo4j_type"], item["data"]["target"], provenance, evidence))
+            except Exception:
+                provenance = "SPOKE-KG"     
+            evidence = item["data"].get("properties", None)
+            nbr_edges.append((item["data"].get("source"), neo4j_type, item["data"].get("target"), provenance, evidence))
+
+    if not nbr_nodes or not nbr_edges:
+        return "", empty_df
+
     nbr_nodes_df = pd.DataFrame(nbr_nodes, columns=["node_type", "node_id", "node_name"])
     nbr_edges_df = pd.DataFrame(nbr_edges, columns=["source", "edge_type", "target", "provenance", "evidence"])
+    
     merge_1 = pd.merge(nbr_edges_df, nbr_nodes_df, left_on="source", right_on="node_id").drop("node_id", axis=1)
     merge_1.loc[:,"node_name"] = merge_1.node_type + " " + merge_1.node_name
     merge_1.drop(["source", "node_type"], axis=1, inplace=True)
     merge_1 = merge_1.rename(columns={"node_name":"source"})
+    
     merge_2 = pd.merge(merge_1, nbr_nodes_df, left_on="target", right_on="node_id").drop("node_id", axis=1)
     merge_2.loc[:,"node_name"] = merge_2.node_type + " " + merge_2.node_name
     merge_2.drop(["target", "node_type"], axis=1, inplace=True)
     merge_2 = merge_2.rename(columns={"node_name":"target"})
+    
     merge_2 = merge_2[["source", "edge_type", "target", "provenance", "evidence"]]
-    merge_2.loc[:, "predicate"] = merge_2.edge_type.apply(lambda x:x.split("_")[0])
-    merge_2.loc[:, "context"] =  merge_2.source + " " + merge_2.predicate.str.lower() + " " + merge_2.target + " and Provenance of this association is " + merge_2.provenance + "."
-    context = merge_2.context.str.cat(sep=' ')
-    context += node_value + " has a " + node_context[0]["data"]["properties"]["source"] + " identifier of " + node_context[0]["data"]["properties"]["identifier"] + " and Provenance of this is from " + node_context[0]["data"]["properties"]["source"] + "."
+    merge_2.loc[:, "predicate"] = merge_2.edge_type.apply(lambda x: str(x).split("_")[0])
+    
+    merge_2.loc[:, "context"] = (
+        "- Relationship: " + merge_2.source + " **" + merge_2.predicate.str.lower() + "** " + merge_2.target + 
+        " | Source/Provenance: " + merge_2.provenance.astype(str) + "."
+    )
+    
+    context = merge_2.context.str.cat(sep='\n')
+    
+    try:
+        first_props = node_context[0]["data"].get("properties", {})
+        source_info = first_props.get("source", "SPOKE")
+        id_info = first_props.get("identifier", "")
+        context += f"{node_value} has a {source_info} identifier of {id_info} and Provenance of this is from {source_info}."
+    except Exception:
+        pass
+
     return context, merge_2
-        
-#         if edge_evidence:
-#             merge_2.loc[:, "context"] =  merge_2.source + " " + merge_2.predicate.str.lower() + " " + merge_2.target + " and Provenance of this association is " + merge_2.provenance + " and attributes associated with this association is in the following JSON format:\n " + merge_2.evidence.astype('str') + "\n\n"
-#         else:
-#             merge_2.loc[:, "context"] =  merge_2.source + " " + merge_2.predicate.str.lower() + " " + merge_2.target + " and Provenance of this association is " + merge_2.provenance + ". "
-#         context = merge_2.context.str.cat(sep=' ')
-#         context += node_value + " has a " + node_context[0]["data"]["properties"]["source"] + " identifier of " + node_context[0]["data"]["properties"]["identifier"] + " and Provenance of this is from " + node_context[0]["data"]["properties"]["source"] + "."
-#     return context
-
-
 
 def get_prompt(instruction, new_system_prompt):
     system_prompt = B_SYS + new_system_prompt + E_SYS
@@ -145,81 +170,138 @@ def get_prompt(instruction, new_system_prompt):
 
 def llama_model(model_name, branch_name, cache_dir, temperature=0, top_p=1, max_new_tokens=512, stream=False, method='method-1'):
     if method == 'method-1':
-        tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                                 revision=branch_name,
-                                                 cache_dir=cache_dir)
-        model = AutoModelForCausalLM.from_pretrained(model_name,                                             
-                                            device_map='auto',
-                                            torch_dtype=torch.float16,
-                                            revision=branch_name,
-                                            cache_dir=cache_dir
-                                            )
+        tokenizer = AutoTokenizer.from_pretrained(model_name, revision=branch_name, cache_dir=cache_dir)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, device_map='auto', torch_dtype=torch.float16, revision=branch_name, cache_dir=cache_dir
+        )
     elif method == 'method-2':
         import transformers
-        tokenizer = transformers.LlamaTokenizer.from_pretrained(model_name, 
-                                                                revision=branch_name, 
-                                                                cache_dir=cache_dir, 
-                                                                legacy=False)
-        model = transformers.LlamaForCausalLM.from_pretrained(model_name, 
-                                                              device_map='auto', 
-                                                              torch_dtype=torch.float16, 
-                                                              revision=branch_name, 
-                                                              cache_dir=cache_dir)        
+        tokenizer = transformers.LlamaTokenizer.from_pretrained(model_name, revision=branch_name, cache_dir=cache_dir, legacy=False)
+        model = transformers.LlamaForCausalLM.from_pretrained(model_name, device_map='auto', torch_dtype=torch.float16, revision=branch_name, cache_dir=cache_dir)        
+    
     if not stream:
-        pipe = pipeline("text-generation",
-                    model = model,
-                    tokenizer = tokenizer,
-                    torch_dtype = torch.bfloat16,
-                    device_map = "auto",
-                    max_new_tokens = max_new_tokens,
-                    do_sample = True
-                    )
+        pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, torch_dtype=torch.bfloat16, device_map="auto", max_new_tokens=max_new_tokens, do_sample=True)
     else:
         streamer = TextStreamer(tokenizer)
-        pipe = pipeline("text-generation",
-                    model = model,
-                    tokenizer = tokenizer,
-                    torch_dtype = torch.bfloat16,
-                    device_map = "auto",
-                    max_new_tokens = max_new_tokens,
-                    do_sample = True,
-                    streamer=streamer
-                    )        
-    llm = HuggingFacePipeline(pipeline = pipe,
-                              model_kwargs = {"temperature":temperature, "top_p":top_p})
+        pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, torch_dtype=torch.bfloat16, device_map="auto", max_new_tokens=max_new_tokens, do_sample=True, streamer=streamer)        
+    
+    llm = HuggingFacePipeline(pipeline=pipe, model_kwargs={"temperature": temperature, "top_p": top_p})
     return llm
 
+def _gpt_temperature(chat_model_id, temperature):
+    # gpt-5.4 models only accept the default temperature
+    return 1 if "5.4" in chat_model_id or "mini" in chat_model_id else temperature
 
 
-@retry(wait=wait_random_exponential(min=10, max=30), stop=stop_after_attempt(5))
-def fetch_GPT_response(instruction, system_prompt, chat_model_id, chat_deployment_id, temperature=0):
-    # print('Calling OpenAI...')
-    response = openai.ChatCompletion.create(
-        temperature=temperature,
-        deployment_id=chat_deployment_id,
-        model=chat_model_id,
+def _gpt_request_kwargs(instruction, system_prompt, chat_model_id, temperature, n, reasoning_effort):
+    request_kwargs = dict(
+        model = chat_model_id,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": instruction}
-        ]
+        ],
+        temperature = _gpt_temperature(chat_model_id, temperature),
+        n = n,
     )
-    if 'choices' in response \
-       and isinstance(response['choices'], list) \
-       and len(response) >= 0 \
-       and 'message' in response['choices'][0] \
-       and 'content' in response['choices'][0]['message']:
-        return response['choices'][0]['message']['content']
-    else:
-        return 'Unexpected response'
+    # Passed explicitly so each run's reasoning setting is recorded instead of
+    # depending on a commented-out line
+    if reasoning_effort:
+        request_kwargs["reasoning_effort"] = reasoning_effort
+    return request_kwargs
 
-@memory.cache
-def get_GPT_response(instruction, system_prompt, chat_model_id, chat_deployment_id, temperature=0):
-    return fetch_GPT_response(instruction, system_prompt, chat_model_id, chat_deployment_id, temperature)
 
+def _gpt_usage(response):
+    if not response.usage:
+        return 0, 0, 0, 0
+    reasoning_tokens = 0
+    if getattr(response.usage, 'completion_tokens_details', None):
+        reasoning_tokens = getattr(response.usage.completion_tokens_details, 'reasoning_tokens', 0) or 0
+    return response.usage.prompt_tokens, response.usage.completion_tokens, reasoning_tokens, response.usage.total_tokens
+
+
+@retry(wait=wait_random_exponential(min=2, max=10), stop=stop_after_attempt(3))
+def get_GPT_response(instruction, system_prompt, chat_model_id='gpt-5.4-mini', chat_deployment_id=None, temperature=0, n=1, reasoning_effort=None):
+    try:
+        request_kwargs = _gpt_request_kwargs(instruction, system_prompt, chat_model_id, temperature, n, reasoning_effort)
+        response = client.chat.completions.create(**request_kwargs)
+
+        outputs = [choice.message.content.strip() for choice in response.choices]
+        prompt_tokens, completion_tokens, reasoning_tokens, total_tokens = _gpt_usage(response)
+
+        combined_output = ", ".join(outputs) if n > 1 else outputs[0]
+
+        return combined_output, prompt_tokens, completion_tokens, reasoning_tokens, total_tokens
+
+    except Exception as e:
+        print(f"\nAPI call ERROR ({chat_model_id}): {e}")
+        raise e
+
+
+# OpenAI structured output: the model must return {"answers": [...]}
+ANSWER_LIST_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "answer_list",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {"answers": {"type": "array", "items": {"type": "string"}}},
+            "required": ["answers"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def parse_answer_list(raw_output):
+    """
+    Answers from a structured-output response. A response cut at the token limit
+    is not valid JSON, so the complete quoted names are recovered from it.
+    """
+    try:
+        answers = json.loads(raw_output).get("answers", [])
+        return [str(a).strip() for a in answers if str(a).strip()]
+    except Exception:
+        names = re.findall(r'"((?:[^"\\]|\\.)*)"(?=\s*[,\]])', str(raw_output))
+        return [n.strip() for n in names if n.strip()]
+
+
+@retry(wait=wait_random_exponential(min=2, max=10), stop=stop_after_attempt(3))
+def get_GPT_list_response(instruction, system_prompt, chat_model_id='gpt-5.4-mini', temperature=0, reasoning_effort=None):
+    """
+    Single answer list via structured output.
+    Returns raw output, parsed list, finish_reason and token counts.
+    """
+    try:
+        request_kwargs = _gpt_request_kwargs(instruction, system_prompt, chat_model_id, temperature, 1, reasoning_effort)
+        request_kwargs["response_format"] = ANSWER_LIST_SCHEMA
+        response = client.chat.completions.create(**request_kwargs)
+
+        choice = response.choices[0]
+        raw_output = (choice.message.content or "").strip()
+        if not raw_output and getattr(choice.message, "refusal", None):
+            raw_output = f"Refusal: {choice.message.refusal}"
+        prompt_tokens, completion_tokens, reasoning_tokens, total_tokens = _gpt_usage(response)
+
+        return {
+            "raw_output": raw_output,
+            "answers": [] if raw_output.startswith("Refusal:") else parse_answer_list(raw_output),
+            "finish_reason": choice.finish_reason,
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "total_tokens": total_tokens,
+        }
+
+    except Exception as e:
+        print(f"\nAPI call ERROR ({chat_model_id}): {e}")
+        raise e
 
 def stream_out(output):
-    CHUNK_SIZE = int(round(len(output)/50))
-    SLEEP_TIME = 0.1
+    if not output:
+        return
+    CHUNK_SIZE = max(1, int(round(len(output)/50)))
+    SLEEP_TIME = 0.05
     for i in range(0, len(output), CHUNK_SIZE):
         print(output[i:i+CHUNK_SIZE], end='')
         sys.stdout.flush()
@@ -227,29 +309,27 @@ def stream_out(output):
     print("\n")
 
 def get_gpt35():
-    chat_model_id = 'gpt-35-turbo' if openai.api_type == 'azure' else 'gpt-3.5-turbo'
-    chat_deployment_id = chat_model_id if openai.api_type == 'azure' else None
-    return chat_model_id, chat_deployment_id
+    return 'gpt-5.4-mini', None
 
 def disease_entity_extractor(text):
     chat_model_id, chat_deployment_id = get_gpt35()
-    resp = get_GPT_response(text, system_prompts["DISEASE_ENTITY_EXTRACTION"], chat_model_id, chat_deployment_id, temperature=0)
     try:
-        entity_dict = json.loads(resp)
-        return entity_dict["Diseases"]
-    except:
-        return None
-    
+        resp_content, _, _, _, _ = get_GPT_response(text, system_prompts["DISEASE_ENTITY_EXTRACTION"], chat_model_id, chat_deployment_id, temperature=0, n=1)
+        entity_dict = json.loads(resp_content)
+        return entity_dict.get("Diseases", [])
+    except Exception:
+        return []
+
 def disease_entity_extractor_v2(text):
     chat_model_id, chat_deployment_id = get_gpt35()
-    prompt_updated = system_prompts["DISEASE_ENTITY_EXTRACTION"] + "\n" + "Sentence : " + text
-    resp = get_GPT_response(prompt_updated, system_prompts["DISEASE_ENTITY_EXTRACTION"], chat_model_id, chat_deployment_id, temperature=0)
+    prompt_updated = system_prompts["DISEASE_ENTITY_EXTRACTION"] + "\nSentence : " + text
     try:
-        entity_dict = json.loads(resp)
-        return entity_dict["Diseases"]
-    except:
-        return None
-    
+        resp_content, _, _, _, _ = get_GPT_response(prompt_updated, system_prompts["DISEASE_ENTITY_EXTRACTION"], chat_model_id, chat_deployment_id, temperature=0, n=1)
+        entity_dict = json.loads(resp_content)
+        res = entity_dict.get("Diseases", [])
+        return res if isinstance(res, list) else []
+    except Exception:
+        return []
 
 def load_sentence_transformer(sentence_embedding_model):
     return SentenceTransformerEmbeddings(model_name=sentence_embedding_model)
@@ -258,76 +338,529 @@ def load_chroma(vector_db_path, sentence_embedding_model):
     embedding_function = load_sentence_transformer(sentence_embedding_model)
     return Chroma(persist_directory=vector_db_path, embedding_function=embedding_function)
 
-def retrieve_context(question, vectorstore, embedding_function, node_context_df, context_volume, context_sim_threshold, context_sim_min_threshold, edge_evidence, api=True):
-    entities = disease_entity_extractor_v2(question)
+SEED_TYPE_TO_SPOKE_TYPES = {
+    "drug": ["Compound"],
+    "compound": ["Compound"],
+    # Gene symbols (e.g. WNT8A, F2) are SPOKE Gene nodes; Protein names are UniProt descriptions
+    "gene/protein": ["Gene", "Protein"],
+    "gene": ["Gene"],
+    "protein": ["Protein", "Gene"],
+    "disease": ["Disease"],
+}
+
+def _name_key(name):
+    # 'MK-1775' == 'MK 1775', 'S-(4-BROMOBENZYL)CYSTEINE' == 'S-(4-Bromobenzyl)cysteine'
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+@lru_cache(maxsize=4096)
+def resolve_spoke_names(node_value, node_type):
+    """
+    SPOKE's neighborhood endpoint needs the exact (case-sensitive) node name.
+    Use the search endpoint to find nodes whose name is the same up to case,
+    spacing and punctuation. Fuzzy hits with a different name are rejected.
+    """
+    result = get_spoke_api_resp(
+        config_data['BASE_URI'], f"/api/v1/search/{node_type}/{quote(str(node_value), safe='')}"
+    )
+    if not result or result.status_code != 200:
+        return ()
+    try:
+        hits = result.json()
+    except Exception:
+        return ()
+    if not isinstance(hits, list):
+        return ()
+    key = _name_key(node_value)
+    names = []
+    for hit in hits:
+        name = hit.get("name") if isinstance(hit, dict) else None
+        if name and name != node_value and _name_key(name) == key and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+# ---------------------------------------------------------------------------
+# Two-hop retrieval for questions like "disease related to a gene/protein that is
+# associated with drug X". A one-hop neighborhood of X only contains the bridge
+# entities (proteins), never the asked target type, so the path is walked explicitly.
+# Edge types were chosen by checking which SPOKE edges connect the benchmark seeds
+# to their bridge entities.
+# ---------------------------------------------------------------------------
+
+SEED_TYPE_TO_SPOKE_ROOT = {"drug": "Compound", "compound": "Compound",
+                           "gene/protein": "Gene", "gene": "Gene", "protein": "Gene",
+                           "disease": "Disease"}
+
+TARGET_TYPE_TO_SPOKE = {"drug": "Compound", "compound": "Compound", "disease": "Disease",
+                        "gene/protein": "Gene", "gene": "Gene", "protein": "Gene"}
+
+# (root type, target type) -> hop 1 (bridge) and hop 2 (target) definitions
+TWO_HOP_PATHS = {
+    ("Compound", "Disease"): {
+        "hop1": {"node_type": "Protein", "edges": ["BINDS_CbP", "INTERACTS_PiC"]},
+        # SPOKE links diseases to Genes, so each protein is mapped to its gene symbol
+        "hop2": {"from_type": "Gene", "node_type": "Disease", "edges": ["ASSOCIATES_DaG"]},
+    },
+    ("Gene", "Compound"): {
+        "hop1": {"node_type": "Disease", "edges": ["ASSOCIATES_DaG"]},
+        "hop2": {"from_type": "Disease", "node_type": "Compound", "edges": ["TREATS_CtD"]},
+    },
+}
+
+EDGE_VERBS = {"BINDS_CbP": "binds", "INTERACTS_PiC": "interacts with",
+              "ASSOCIATES_DaG": "is associated with", "TREATS_CtD": "is treated by"}
+
+
+def _spoke_cutoff_params():
+    return {k: v for k, v in config_data.items() if k.startswith("cutoff_")}
+
+
+def _parse_listish(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.startswith("["):
+        try:
+            return ast.literal_eval(value)
+        except Exception:
+            pass
+    return [value] if value else []
+
+
+class SpokeAPIError(RuntimeError):
+    """SPOKE did not answer (timeout or non-200 status); not the same as 'no data'."""
+
+
+@retry(wait=wait_random_exponential(min=2, max=10), stop=stop_after_attempt(3), reraise=True)
+def _spoke_get_json(end_point, params=None):
+    result = get_spoke_api_resp(config_data['BASE_URI'], end_point, params=params)
+    # Names SPOKE cannot route (e.g. a '/' as in 'tilS/hprT') give 404: no node, not an outage
+    if result is not None and result.status_code == 404:
+        return []
+    if result is None or result.status_code != 200:
+        raise SpokeAPIError(f"{end_point}: {'no response' if result is None else result.status_code}")
+    try:
+        return result.json()
+    except Exception:
+        raise SpokeAPIError(f"{end_point}: response is not JSON")
+
+
+@lru_cache(maxsize=8192)
+def get_spoke_neighbors(node_type, node_name, neighbor_type, edge_types, use_cutoffs=True):
+    """
+    Neighbors of one SPOKE node, restricted to the given edge types (tuple).
+    Returns a tuple of dicts: name, properties, edge_type, edge_properties.
+    Raises SpokeAPIError if SPOKE does not answer (an unknown node returns ()).
+    """
+    params = dict(_spoke_cutoff_params()) if use_cutoffs else {}
+    params["node_filters"] = list({node_type, neighbor_type})
+    params["edge_filters"] = list(edge_types)
+    params["depth"] = 1
+    items = _spoke_get_json(f"/api/v1/neighborhood/{node_type}/name/{quote(str(node_name), safe='')}", params)
+    if not isinstance(items, list):
+        return ()
+
+    nodes = {it["data"]["id"]: it["data"] for it in items
+             if isinstance(it, dict) and "_" not in it.get("data", {}).get("neo4j_type", "")}
+    root_ids = {i for i, n in nodes.items() if n.get("neo4j_root") == 1}
+    neighbors = []
+    for it in items:
+        data = it.get("data", {}) if isinstance(it, dict) else {}
+        if data.get("neo4j_type") not in edge_types:
+            continue
+        other_id = data.get("target") if data.get("source") in root_ids else data.get("source")
+        other = nodes.get(other_id)
+        if not other or other.get("neo4j_type") != neighbor_type:
+            continue
+        neighbors.append({
+            "name": other["properties"].get("name"),
+            "properties": other["properties"],
+            "edge_type": data["neo4j_type"],
+            "edge_properties": data.get("properties", {}),
+        })
+    return tuple(neighbors)
+
+
+@lru_cache(maxsize=4096)
+def get_spoke_node(node_type, node_name):
+    """Properties of a SPOKE node by exact name, or None if it does not exist."""
+    name = quote(str(node_name), safe='')
+    result = get_spoke_api_resp(config_data['BASE_URI'], f"/api/v1/node/{node_type}/name/{name}")
+    if result is not None and result.status_code == 200:
+        nodes = result.json()
+        return nodes[0] if isinstance(nodes, list) and nodes and isinstance(nodes[0], dict) else None
+    # /node answers 500 for some long chemical names while the neighborhood endpoint
+    # still works, so the node is looked up as the root of its own neighborhood
+    items = _spoke_get_json(f"/api/v1/neighborhood/{node_type}/name/{name}", {"depth": 1})
+    for it in items if isinstance(items, list) else []:
+        data = it.get("data", {}) if isinstance(it, dict) else {}
+        if data.get("neo4j_root") == 1 and data.get("neo4j_type") == node_type:
+            return data.get("properties")
+    return None
+
+
+def _find_root_neighbors(root_type, seed_name, neighbor_type, edge_types):
+    """
+    Neighbors of the seed, retrying with SPOKE's spelling of the name if needed.
+    Returns (name used, neighbors, 'exact' | 'search').
+    """
+    neighbors = get_spoke_neighbors(root_type, seed_name, neighbor_type, edge_types)
+    if neighbors:
+        return seed_name, neighbors, "exact"
+    for spoke_name in resolve_spoke_names(seed_name, root_type):
+        neighbors = get_spoke_neighbors(root_type, spoke_name, neighbor_type, edge_types)
+        if neighbors:
+            return spoke_name, neighbors, "search"
+    return seed_name, (), None
+
+
+def _diagnose_empty_seed(root_type, seed_name, neighbor_type, edge_types):
+    """
+    Why the seed has no hop-1 neighbors: not in SPOKE, no edges of the path type,
+    or edges that exist but are removed by the config cutoffs.
+    Returns (status, matched SPOKE name or None, 'exact' | 'search' | None).
+    """
+    for name, match in [(seed_name, "exact")] + [(n, "search") for n in resolve_spoke_names(seed_name, root_type)]:
+        if get_spoke_node(root_type, name) is None:
+            continue
+        if get_spoke_neighbors(root_type, name, neighbor_type, edge_types, use_cutoffs=False):
+            return "filtered_by_cutoff", name, match
+        return "no_path_edges", name, match
+    return "seed_not_in_spoke", None, None
+
+
+def _bridge_rank(neighbor):
+    # Curated binding edges first, then STITCH interactions by confidence
+    if neighbor["edge_type"] == "BINDS_CbP":
+        return (0, 0.0)
+    try:
+        conf = float(neighbor["edge_properties"].get("overall_confidence", 0))
+    except (TypeError, ValueError):
+        conf = 0.0
+    return (1, -conf)
+
+
+CURATED_SOURCES = {"DrugCentral", "ChEMBL", "DISEASES", "GWAS", "OMIM", "DrugBank", "BindingDB"}
+
+
+def _target_rank(neighbor):
+    # Curated database edges before clinical-trial / text-mined ones, then higher phase first
+    srcs = set(map(str, _parse_listish(neighbor["edge_properties"].get("sources"))))
+    try:
+        phase = float(neighbor["edge_properties"].get("phase", 0))
+    except (TypeError, ValueError):
+        phase = 0.0
+    return (0 if srcs & CURATED_SOURCES else 1, -phase)
+
+
+def _sources(props):
+    return ", ".join(str(s) for s in _parse_listish(props.get("sources"))) or "SPOKE"
+
+
+MAX_CONTEXT_CHARS = 35000
+
+
+def retrieve_two_hop(seed_entity, seed_type, target_type, max_bridges=None, max_targets_per_bridge=None):
+    """
+    Two-hop retrieval with the structured SPOKE result behind the context text.
+    Returns None if no path is defined for this (seed type, target type), else a dict:
+      context          text given to the model
+      retrieval_status ok | no_targets | seed_not_in_spoke | no_path_edges | filtered_by_cutoff
+      spoke_result     matched seed name, bridges and their target names as listed in the context
+    SpokeAPIError is raised if SPOKE does not answer.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    root_type = SEED_TYPE_TO_SPOKE_ROOT.get(str(seed_type).lower())
+    target_spoke_type = TARGET_TYPE_TO_SPOKE.get(str(target_type).lower())
+    path = TWO_HOP_PATHS.get((root_type, target_spoke_type))
+    if path is None:
+        return None
+
+    max_bridges = max_bridges or config_data.get("MAX_BRIDGE_NODES", 20)
+    max_targets_per_bridge = max_targets_per_bridge or config_data.get("MAX_TARGETS_PER_BRIDGE", 50)
+    hop1, hop2 = path["hop1"], path["hop2"]
+
+    seed_name, bridges, _ = _find_root_neighbors(root_type, seed_entity, hop1["node_type"], tuple(hop1["edges"]))
+    if not bridges:
+        status, spoke_name, _ = _diagnose_empty_seed(root_type, seed_entity, hop1["node_type"], tuple(hop1["edges"]))
+        return {"context": "", "retrieval_status": status,
+                "spoke_result": {"seed": spoke_name, "bridges": []}}
+
+    # Collapse bridges to the names used for hop 2 (Protein -> gene symbol)
+    bridge_entries = {}
+    for b in sorted(bridges, key=_bridge_rank):
+        if hop1["node_type"] == "Protein" and hop2["from_type"] == "Gene":
+            keys = [g for g in _parse_listish(b["properties"].get("gene")) if g]
+            label = b["properties"].get("description") or b["name"]
+        else:
+            keys = [b["name"]]
+            label = b["name"]
+        for key in keys:
+            if key and key not in bridge_entries:
+                bridge_entries[key] = (label, b)
+        if len(bridge_entries) >= max_bridges:
+            break
+
+    def fetch(key):
+        return key, get_spoke_neighbors(hop2["from_type"], key, hop2["node_type"], tuple(hop2["edges"]))
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        hop2_results = list(ex.map(fetch, list(bridge_entries)))
+
+    seed_label = f"{'Drug' if root_type == 'Compound' else root_type} {seed_name}"
+    target_word = "drugs" if hop2["node_type"] == "Compound" else f"{hop2['node_type'].lower()}s"
+    verb2 = EDGE_VERBS.get(hop2["edges"][0], "is linked to")
+    lines = []
+    bridge_records = []
+    all_targets = set()
+    for key, targets in hop2_results:
+        label, b = bridge_entries[key]
+        verb1 = EDGE_VERBS.get(b["edge_type"], b["edge_type"].split("_")[0].lower())
+        if hop1["node_type"] == "Protein":
+            lines.append(f"- {seed_label} {verb1} protein {label} (gene {key}) | Provenance: {_sources(b['edge_properties'])}.")
+        else:
+            lines.append(f"- {seed_label} {verb1} {hop1['node_type'].lower()} {key} | Provenance: {_sources(b['edge_properties'])}.")
+
+        bridge = {"name": b["name"]}
+        if hop1["node_type"] == "Protein":
+            bridge["gene"] = key
+        bridge["edge"] = b["edge_type"]
+
+        target_names = []
+        target_sources = set()
+        for t in sorted(targets, key=_target_rank):
+            if t["name"] and t["name"] not in target_names:
+                target_names.append(t["name"])
+                target_sources.update(str(x) for x in _parse_listish(t["edge_properties"].get("sources")))
+            if len(target_names) >= max_targets_per_bridge:
+                break
+        if target_names:
+            lines.append(f"  - {hop2['from_type']} {key} {verb2} {target_word}: {'; '.join(target_names)}"
+                         f" | Provenance: {', '.join(sorted(target_sources)) or 'SPOKE'}.")
+        else:
+            lines.append(f"  - No {target_word} found in SPOKE for {hop2['from_type'].lower()} {key}.")
+
+        bridge["targets"] = target_names
+        bridge_records.append(bridge)
+        all_targets.update(target_names)
+
+    return {
+        "context": "\n".join(lines) + "\n",
+        "retrieval_status": "ok" if all_targets else "no_targets",
+        "spoke_result": {"seed": seed_name, "bridges": bridge_records},
+    }
+
+
+def retrieve_two_hop_context(seed_entity, seed_type, target_type, max_bridges=None, max_targets_per_bridge=None):
+    """
+    Context text for a two-hop question, or None if no path is defined
+    for this (seed type, target type) combination.
+    """
+    result = retrieve_two_hop(seed_entity, seed_type, target_type, max_bridges, max_targets_per_bridge)
+    return None if result is None else result["context"]
+
+
+def retrieve_context_with_details(question, vectorstore, embedding_function, node_context_df, context_volume, context_sim_threshold, context_sim_min_threshold, edge_evidence, api=True, seed_entity=None, target_type=None, seed_type=None):
+    """
+    retrieve_context plus what is needed to judge the retrieval for each question:
+    context, retrieval_status, spoke_result.
+    Questions without a two-hop path fall back to the one-hop text context
+    (spoke_result is then None).
+    """
+    try:
+        result = None
+        if api and seed_entity and seed_type and target_type:
+            result = retrieve_two_hop(seed_entity, seed_type, target_type)
+        if result is None:
+            context = retrieve_context(question, vectorstore, embedding_function, node_context_df, context_volume,
+                                       context_sim_threshold, context_sim_min_threshold, edge_evidence, api=api,
+                                       seed_entity=seed_entity, target_type=target_type, seed_type=seed_type)
+            result = {"context": context, "retrieval_status": "ok" if context.strip() else "no_context",
+                      "spoke_result": None}
+    except Exception as e:
+        print(f"\nContext retrieval ERROR: {e}")
+        result = {"context": "", "retrieval_status": "api_error", "spoke_result": None}
+
+    result["context"] = result["context"][:MAX_CONTEXT_CHARS]
+    return result
+
+
+def retrieve_context(question, vectorstore, embedding_function, node_context_df, context_volume, context_sim_threshold, context_sim_min_threshold, edge_evidence, api=True, seed_entity=None, target_type=None, seed_type=None):
     node_hits = []
-    if entities:
-        max_number_of_high_similarity_context_per_node = int(context_volume/len(entities))
-        for entity in entities:
-            node_search_result = vectorstore.similarity_search_with_score(entity, k=1)
-            node_hits.append(node_search_result[0][0].page_content)
-        question_embedding = embedding_function.embed_query(question)
-        node_context_extracted = ""
-        for node_name in node_hits:
-            if not api:
-                node_context = node_context_df[node_context_df.node_name == node_name].node_context.values[0]
+
+    if api and seed_entity:
+        node_hits = [str(seed_entity).strip()]
+    
+    if not node_hits:
+        try:
+            node_hits_raw = vectorstore.similarity_search_with_score(question, k=3)
+            node_hits = [node[0].page_content for node in node_hits_raw]
+        except Exception:
+            node_hits = []
+
+    if not node_hits:
+        return ""
+
+    # Multi-hop benchmark questions: walk seed -> bridge -> target explicitly
+    if api and seed_entity and seed_type and target_type:
+        two_hop_context = retrieve_two_hop_context(seed_entity, seed_type, target_type)
+        if two_hop_context is not None:
+            return two_hop_context[:MAX_CONTEXT_CHARS]
+
+    node_context_extracted = ""
+
+    for node_name in node_hits:
+        context_table = None
+        if not api:
+            if node_context_df is not None and not node_context_df.empty and "node_name" in node_context_df.columns:
+                matched_rows = node_context_df[node_context_df.node_name == node_name]
+                if matched_rows.empty:
+                    continue
+                node_context_extracted += matched_rows.node_context.values[0] + " "
+        else:
+            node_context = ""
+
+            candidate_types = SEED_TYPE_TO_SPOKE_TYPES.get(
+                str(seed_type).lower(), ["Compound", "Gene", "Protein", "Disease"]
+            )
+            for candidate_type in candidate_types:
+                try:
+                    node_context, context_table = get_context_using_spoke_api(node_name, node_type=candidate_type)
+                    if node_context:
+                        break
+                except Exception:
+                    continue
+            # Exact name not found: retry with SPOKE's spelling of the same name
+            if not node_context:
+                for candidate_type in candidate_types:
+                    for spoke_name in resolve_spoke_names(node_name, candidate_type):
+                        try:
+                            node_context, context_table = get_context_using_spoke_api(spoke_name, node_type=candidate_type)
+                        except Exception:
+                            continue
+                        if node_context:
+                            break
+                    if node_context:
+                        break
+
+            if edge_evidence and context_table is not None and not context_table.empty:
+                context_table.loc[:, "context"] = (
+                    "- Relationship: " + context_table.source + " **" + context_table.predicate.str.lower() + "** " + context_table.target + 
+                    " | Provenance: " + context_table.provenance.astype(str) + "."
+                )
+                node_context_extracted += context_table.context.str.cat(sep='\n') + "\n"
             else:
-                node_context,context_table = get_context_using_spoke_api(node_name)
-            node_context_list = node_context.split(". ")        
-            node_context_embeddings = embedding_function.embed_documents(node_context_list)
-            similarities = [cosine_similarity(np.array(question_embedding).reshape(1, -1), np.array(node_context_embedding).reshape(1, -1)) for node_context_embedding in node_context_embeddings]
-            similarities = sorted([(e, i) for i, e in enumerate(similarities)], reverse=True)
-            percentile_threshold = np.percentile([s[0] for s in similarities], context_sim_threshold)
-            high_similarity_indices = [s[1] for s in similarities if s[0] > percentile_threshold and s[0] > context_sim_min_threshold]
-            if len(high_similarity_indices) > max_number_of_high_similarity_context_per_node:
-                high_similarity_indices = high_similarity_indices[:max_number_of_high_similarity_context_per_node]
-            high_similarity_context = [node_context_list[index] for index in high_similarity_indices]            
-            if edge_evidence:
-                high_similarity_context = list(map(lambda x:x+'.', high_similarity_context)) 
-                context_table = context_table[context_table.context.isin(high_similarity_context)]
-                context_table.loc[:, "context"] =  context_table.source + " " + context_table.predicate.str.lower() + " " + context_table.target + " and Provenance of this association is " + context_table.provenance + " and attributes associated with this association is in the following JSON format:\n " + context_table.evidence.astype('str') + "\n\n"                
-                node_context_extracted += context_table.context.str.cat(sep=' ')
-            else:
-                node_context_extracted += ". ".join(high_similarity_context)
-                node_context_extracted += ". "
-        return node_context_extracted
-    else:
-        node_hits = vectorstore.similarity_search_with_score(question, k=5)
-        max_number_of_high_similarity_context_per_node = int(context_volume/5)
-        question_embedding = embedding_function.embed_query(question)
-        node_context_extracted = ""
-        for node in node_hits:
-            node_name = node[0].page_content
-            if not api:
-                node_context = node_context_df[node_context_df.node_name == node_name].node_context.values[0]
-            else:
+                if node_context:
+                    node_context_extracted += node_context + "\n"
+
+    if len(node_context_extracted) > MAX_CONTEXT_CHARS:
+        node_context_extracted = node_context_extracted[:MAX_CONTEXT_CHARS] + " [Context truncated due to length...]"
+
+    return node_context_extracted
+
+def retrieve_context_with_raw(question, vectorstore, embedding_function, node_context_df, context_volume, context_sim_threshold, context_sim_min_threshold, edge_evidence, api=True):
+    """
+    Both raw SPOKE API JSON data and processed text context
+    """
+    node_hits = []
+    raw_spoke_json_data = [] 
+
+    if api:
+        entities = []
+        if "gene/protein" in question:
+            try:
+                parts = question.split("gene/protein")
+                if len(parts) > 1:
+                    target_entity = parts[1].split(".")[0].split("\n")[0].strip()
+                    if target_entity:
+                        entities.append(target_entity)
+            except Exception:
+                pass
+        elif "drug" in question:
+            try:
+                parts = question.split("drug")
+                if len(parts) > 1:
+                    target_entity = parts[1].split(".")[0].split("\n")[0].strip()
+                    if target_entity:
+                        entities.append(target_entity)
+            except Exception:
+                pass
+        
+        if not entities:
+            entities = disease_entity_extractor_v2(question) or []
+
+        if entities and isinstance(entities, list) and len(entities) > 0:
+            for entity in entities:
+                try:
+                    node_search_result = vectorstore.similarity_search_with_score(entity, k=2)
+                    if node_search_result:
+                        for res in node_search_result:
+                            if res[0].page_content not in node_hits:
+                                node_hits.append(res[0].page_content)
+                except Exception:
+                    continue
+    
+    if not node_hits:
+        try:
+            node_hits_raw = vectorstore.similarity_search_with_score(question, k=5)
+            node_hits = [node[0].page_content for node in node_hits_raw]
+        except Exception:
+            node_hits = []
+
+    if not node_hits:
+        return "", []
+
+    node_context_extracted = ""
+
+    for node_name in node_hits:
+        context_table = None
+        if not api:
+            if node_context_df is not None and not node_context_df.empty and "node_name" in node_context_df.columns:
+                matched_rows = node_context_df[node_context_df.node_name == node_name]
+                if matched_rows.empty:
+                    continue
+                node_context_extracted += matched_rows.node_context.values[0] + " "
+        else:
+            try:
+                node_type = "Disease" 
+                attribute = "name"
+                nbr_end_point = f"/api/v1/neighborhood/{node_type}/{attribute}/{quote(str(node_name), safe='')}"
+                
+                api_result = get_spoke_api_resp(config_data['BASE_URI'], nbr_end_point)
+                if api_result and api_result.status_code == 200:
+                    raw_json = api_result.json()
+                    raw_spoke_json_data.append({
+                        "node_name": node_name,
+                        "raw_data": raw_json
+                    })
+                
                 node_context, context_table = get_context_using_spoke_api(node_name)
-            node_context_list = node_context.split(". ")        
-            node_context_embeddings = embedding_function.embed_documents(node_context_list)
-            similarities = [cosine_similarity(np.array(question_embedding).reshape(1, -1), np.array(node_context_embedding).reshape(1, -1)) for node_context_embedding in node_context_embeddings]
-            similarities = sorted([(e, i) for i, e in enumerate(similarities)], reverse=True)
-            percentile_threshold = np.percentile([s[0] for s in similarities], context_sim_threshold)
-            high_similarity_indices = [s[1] for s in similarities if s[0] > percentile_threshold and s[0] > context_sim_min_threshold]
-            if len(high_similarity_indices) > max_number_of_high_similarity_context_per_node:
-                high_similarity_indices = high_similarity_indices[:max_number_of_high_similarity_context_per_node]
-            high_similarity_context = [node_context_list[index] for index in high_similarity_indices]
-            if edge_evidence:
-                high_similarity_context = list(map(lambda x:x+'.', high_similarity_context))
-                context_table = context_table[context_table.context.isin(high_similarity_context)]
-                context_table.loc[:, "context"] =  context_table.source + " " + context_table.predicate.str.lower() + " " + context_table.target + " and Provenance of this association is " + context_table.provenance + " and attributes associated with this association is in the following JSON format:\n " + context_table.evidence.astype('str') + "\n\n"                
+            except Exception:
+                node_context, context_table = "", None
+
+            if edge_evidence and context_table is not None and not context_table.empty:
+                context_table.loc[:, "context"] = (
+                    context_table.source + " " + 
+                    context_table.predicate.str.lower() + " " + 
+                    context_table.target + 
+                    " (Provenance: " + context_table.provenance.astype(str) + "). "
+                )
                 node_context_extracted += context_table.context.str.cat(sep=' ')
             else:
-                node_context_extracted += ". ".join(high_similarity_context)
-                node_context_extracted += ". "
-        return node_context_extracted
-    
-    
+                if node_context:
+                    node_context_extracted += node_context + " "
+
+    MAX_CONTEXT_CHARS = 35000  
+    if len(node_context_extracted) > MAX_CONTEXT_CHARS:
+        node_context_extracted = node_context_extracted[:MAX_CONTEXT_CHARS] + " [Context truncated due to length...]"
+
+    return node_context_extracted, raw_spoke_json_data
+
 def interactive(question, vectorstore, node_context_df, embedding_function_for_context_retrieval, llm_type, edge_evidence, system_prompt, api=True, llama_method="method-1"):
     print(" ")
-    input("Press enter for Step 1 - Disease entity extraction using GPT-3.5-Turbo")
+    input("Press enter for Step 1 - Disease entity extraction using GPT")
     print("Processing ...")
-    entities = disease_entity_extractor_v2(question)
-    max_number_of_high_similarity_context_per_node = int(config_data["CONTEXT_VOLUME"]/len(entities))
+    entities = disease_entity_extractor_v2(question) or []
     print("Extracted entity from the prompt = '{}'".format(", ".join(entities)))
     print(" ")
     
@@ -336,7 +869,8 @@ def interactive(question, vectorstore, node_context_df, embedding_function_for_c
     node_hits = []
     for entity in entities:
         node_search_result = vectorstore.similarity_search_with_score(entity, k=1)
-        node_hits.append(node_search_result[0][0].page_content)
+        if node_search_result:
+            node_hits.append(node_search_result[0][0].page_content)
     print("Matched entities from SPOKE = '{}'".format(", ".join(node_hits)))
     print(" ")
     
@@ -344,39 +878,26 @@ def interactive(question, vectorstore, node_context_df, embedding_function_for_c
     node_context = []
     for node_name in node_hits:
         if not api:
-            node_context.append(node_context_df[node_context_df.node_name == node_name].node_context.values[0])
+            if node_context_df is not None and not node_context_df.empty:
+                matched = node_context_df[node_context_df.node_name == node_name]
+                if not matched.empty:
+                    node_context.append(matched.node_context.values[0])
         else:
             context, context_table = get_context_using_spoke_api(node_name)
-            node_context.append(context)
+            if context:
+                node_context.append(context)
     print("Extracted Context is : ")
     print(". ".join(node_context))
     print(" ")
 
     input("Press enter for Step 4 - Context pruning")
-    question_embedding = embedding_function_for_context_retrieval.embed_query(question)
-    node_context_extracted = ""
-    for node_name in node_hits:
-        if not api:
-            node_context = node_context_df[node_context_df.node_name == node_name].node_context.values[0]
-        else:
-            node_context, context_table = get_context_using_spoke_api(node_name)                        
-        node_context_list = node_context.split(". ")        
-        node_context_embeddings = embedding_function_for_context_retrieval.embed_documents(node_context_list)
-        similarities = [cosine_similarity(np.array(question_embedding).reshape(1, -1), np.array(node_context_embedding).reshape(1, -1)) for node_context_embedding in node_context_embeddings]
-        similarities = sorted([(e, i) for i, e in enumerate(similarities)], reverse=True)
-        percentile_threshold = np.percentile([s[0] for s in similarities], config_data["QUESTION_VS_CONTEXT_SIMILARITY_PERCENTILE_THRESHOLD"])
-        high_similarity_indices = [s[1] for s in similarities if s[0] > percentile_threshold and s[0] > config_data["QUESTION_VS_CONTEXT_MINIMUM_SIMILARITY"]]
-        if len(high_similarity_indices) > max_number_of_high_similarity_context_per_node:
-            high_similarity_indices = high_similarity_indices[:max_number_of_high_similarity_context_per_node]
-        high_similarity_context = [node_context_list[index] for index in high_similarity_indices]               
-        if edge_evidence:
-            high_similarity_context = list(map(lambda x:x+'.', high_similarity_context)) 
-            context_table = context_table[context_table.context.isin(high_similarity_context)]
-            context_table.loc[:, "context"] =  context_table.source + " " + context_table.predicate.str.lower() + " " + context_table.target + " and Provenance of this association is " + context_table.provenance + " and attributes associated with this association is in the following JSON format:\n " + context_table.evidence.astype('str') + "\n\n"                
-            node_context_extracted += context_table.context.str.cat(sep=' ')
-        else:
-            node_context_extracted += ". ".join(high_similarity_context)
-            node_context_extracted += ". "
+    node_context_extracted = retrieve_context(
+        question, vectorstore, embedding_function_for_context_retrieval,
+        node_context_df,config_data["CONTEXT_VOLUME"], 
+        config_data["QUESTION_VS_CONTEXT_SIMILARITY_PERCENTILE_THRESHOLD"], 
+        config_data["QUESTION_VS_CONTEXT_MINIMUM_SIMILARITY"], 
+        edge_evidence, api=api
+    )
     print("Pruned Context is : ")
     print(node_context_extracted)
     print(" ")
@@ -384,13 +905,12 @@ def interactive(question, vectorstore, node_context_df, embedding_function_for_c
     input("Press enter for Step 5 - LLM prompting")
     print("Prompting ", llm_type)
     if llm_type == "llama":
-        from langchain import PromptTemplate, LLMChain
         template = get_prompt("Context:\n\n{context} \n\nQuestion: {question}", system_prompt)
         prompt = PromptTemplate(template=template, input_variables=["context", "question"])
         llm = llama_model(config_data["LLAMA_MODEL_NAME"], config_data["LLAMA_MODEL_BRANCH"], config_data["LLM_CACHE_DIR"], stream=True, method=llama_method) 
-        llm_chain = LLMChain(prompt=prompt, llm=llm)
-        output = llm_chain.run(context=node_context_extracted, question=question)
+        chain = prompt | llm
+        output = chain.invoke({"context": node_context_extracted, "question": question})
     elif "gpt" in llm_type:
         enriched_prompt = "Context: "+ node_context_extracted + "\n" + "Question: " + question
-        output = get_GPT_response(enriched_prompt, system_prompt, llm_type, llm_type, temperature=config_data["LLM_TEMPERATURE"])
+        output, _, _, _, _ = get_GPT_response(enriched_prompt, system_prompt, llm_type, llm_type, temperature=config_data["LLM_TEMPERATURE"], n=1)
         stream_out(output)

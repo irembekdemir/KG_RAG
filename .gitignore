@@ -24,3 +24,11 @@ codes/generate_textual_knowledge_DrD.ipynb
 codes/node_context_extraction_using_neo4j.ipynb
 codes/logs
 codes/pid_info.sh
+.env
+.env.*
+!.env.example
+*.log
+results/
+backups/
+benchmark_dataset/
+biomixqa_benchmark_results.csv
